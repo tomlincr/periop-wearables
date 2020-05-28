@@ -1,0 +1,93 @@
+---
+title: "Periop Wearables: Heart Rate Data from FitBit"
+output: github_document
+author: "Dr Chris Tomlinson"
+---
+
+In Part 1 we explored using the [fitbitr](https://github.com/teramonagi/fitbitr) package from [Nagi Teramo(teramonagi)](https://github.com/teramonagi) and the [fitbit Web API](https://dev.fitbit.com/build/reference/web-api/) to extract **Heart Rate Time Series** Data.
+
+In Part 2 we will use a *Personal* application API key to access Intraday Time Series Data, giving us heart rate data with a greater temporal resolution e.g. detail-level = 1sec OR 1min.
+
+```{r authenticate, echo=FALSE}
+# Load fitbit web API key into global environment
+#FITBIT_KEY <- "<your OAuth 2.0 Client ID>"
+#FITBIT_SECRET <- "<your Client Secret>"
+
+# Load fitbitr library by teramonagi
+# Installed via devtools::install_github("teramonagi/fitbitr")
+library(fitbitr)
+# Authenticate using OAuth Client ID & Secret
+token <- fitbitr::oauth_token()
+date <- "2020-05-25"
+```
+
+
+We will use the `get_heart_rate_intraday_time_series()` function which has the following arguments:
+ * `date` The date, in the format `yyyy-MM-dd` or `today`.
+ * `detail_level` Number of data points to include. Either `1sec` or `1min`. Optional.
+ * `start_time` The start of the period, in the format `HH:mm`. Optional.
+ * `end_time` The end of the period, in the format `HH:mm`. Optional.
+ 
+Let's look at the structure of the data this function returns:
+```{r getdata}
+str(get_heart_rate_intraday_time_series(token, date = date, detail_level = "1min"))
+```
+Pretty simple, we can see a `data.frame` consisting of 2 variables; a character vector `time` (from `start_time` to `end_time`, defaulting to a 24-hour period from "00:00:00" on the `date` specified) and an integer vector `value` corresponding to the Heart Rate for that time.
+
+Let's import the data into a data.frame and rename `value` to the more descriptive `HR`. We must also convert `time` from a character to something more correct. Otherwise when we call `geom_smooth()` in `ggplot` it won't produce any result. I've used the `as.difftime()` function in base R, rather than the more common `strptime()`, as it gives me a time since midnight in units of my choice, rather than appending the time to todays date which would introduce confusion when analysing data from multiple days.
+
+```{r cleandata}
+df <- get_heart_rate_intraday_time_series(token, date = date, detail_level = "1min")
+# Rename col 'value' to 'HR
+names(df)[2] <- "HR"
+# Convert time from class = character to difftime, i.e. mins since 00:00
+df$time <- as.difftime(df$time, units = "mins")
+
+```
+
+We can plot this data as a simple scatter plot in `ggplot` using `geom_point()`. I've coloured it red, given the cardiac nature of the data, and changed it's transparency `alpha = 0.4` to improve legibility given the close distribution of the points along the x axis.
+
+Finally I've added a smoother (? correct term) using `geom_smooth()` to aid the eye in seeing patterns given the 'overplotting' described above. This defaults to `method = "gam"` with `formula = y ~ s(x, bs = "cs")`. I've elected to show a 95% (default) Confidence Interval using the argument `se = TRUE` .
+
+`labs()` will add a title and label the x-axis, helping to clarify that time is in minutes.
+```{r hrplot}
+library(ggplot2)
+library(ggthemes)
+p <- ggplot(df, aes(x = time, y = HR)) + geom_point(col = "red", alpha = 0.4) + geom_smooth(se = TRUE) + labs(title = "Heart Rate over Time", x = "Time (mins)") + theme_few()
+p
+```
+
+
+### Implementing NEWS2
+I like the minimalism of `theme_few()` which lacks gridlines. However this may make it harder to identify heart rates outside the normal range, particularly to those unfamiliar with looking at such data. After spending much of my life as a junior doctor staring at the paper observation chart at the foot of a patients bed (coloured if you're lucky! NHS technology..) I felt the most useful method to address this would be to implement the Royal College of Physician's [National Early Warning Score (NEWS) 2](https://www.rcplondon.ac.uk/projects/outputs/national-early-warning-score-news-2).
+
+This groups physiological variables, in this case HR, into ranges and assigns them a score based on their deviation from the 'safe' normal range. There are lots of issues with this, chiefly that these are population ranges and may not reflect a patient's normal, but it's straightforward and widely used so that's what we will implement here.
+
+Thus a HR in the normal range gives a NEWS score of 0, whilst deviations in both +ve (tachycardia) and -ve (bradycardia) directions give a NEWS score between 1 - 3 depending on the magnitude of the deviation. The NEWS2 ranges for Heart Rate are shown in the table below (slightly clunky in Rmarkdown I'm afraid, could have used an additional package to improve the formatting).
+
+```{r news}
+NEWS_col_labels <- c("Physiological Parameter", 3:0, 1:3)
+NEWS_HR_ranges <- c("Pulse (per minute)", "<=40", "", "41-50", "51-90", "91-110", "111-130", ">=130")
+NEWS_HR_table <- t(data.frame(NEWS_HR_ranges))
+colnames(NEWS_HR_table) <- NEWS_col_labels
+NEWS_HR_table
+```
+
+To add them to our plot probably the most logical solution would be to use `geom_rect()` to specify four coordinates (`xmin, xmax, ymin, ymax`) to draw rectangles for each range. The `Inf` argument could be used to specify the `x` coordinates, and `ymax` for the upper range of heart rate, to cover the range of the data in the plot.
+
+I decided to use `geom_ribbon()` as only one set of either x- or y-limits are needed, saving typing. Perhaps because I'm relatively new to `ggplot` I find the syntax of `ggplot() + geom_ + geom_ + ...` or the alternative `p <- ggplot()` `p + geom` slightly laborious and 'ugly' compared to usings commas which allow each new function to be placed on a new line.
+
+In conjunction with the fact that having to specify all the ranges for each subsequent plot would get tedious very quickly I felt it was best to create my own function `NEWS2_HR_plotranges()` which would add the NEWS2 HR ranges in their appropriate colours onto any future plot by simply adding. I decided to specify one argument `function(alpha = 0.1)` for alpha (transparency), which would default to 0.1, as this seemed like a parameter I might like to alter in the future and this would again save me from having to alter it for each range.
+
+Note that when creating a function of `ggplot` commands they are created with in a `list` rather than using the traditional `+` notation.
+
+```{r news2}
+NEWS2_HR_plotranges <- function(alpha = 0.1){
+        list(geom_ribbon(aes(ymin = 0, ymax = 40), fill = "red", alpha = alpha), 
+             geom_ribbon(aes(ymin = 40, ymax = 50), fill = "yellow", alpha = alpha), 
+             geom_ribbon(aes(ymin = 90, ymax = 110), fill = "yellow", alpha = alpha), 
+             geom_ribbon(aes(ymin = 110, ymax = 130), fill = "orange", alpha = alpha), 
+             geom_ribbon(aes(ymin = 130, ymax = Inf), fill = "red", alpha = alpha))
+}
+p + NEWS2_HR_plotranges()
+```
